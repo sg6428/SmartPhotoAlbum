@@ -1,0 +1,383 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation template for voice controlled photo album
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  S3BucketPrefix:
+    Type: String
+    Default: cloudformation-s3
+  S3BucketType2:
+    Type: String
+    Default: storage
+  S3BucketPipelineName:
+    Type: String
+    Default: cloudformation-s3-pipeline
+
+  GithubUser:
+    Type: String
+    Default: axit54
+  GithubBranch:
+    Type: String
+    Default: main
+  GithubRepo:
+    Type: String
+    Default: Smart_Photo_Album
+  GithubToken:
+    Type: String
+
+Resources:
+  # S3 bucket for frontend
+  cloudformationS3frontend:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties: 
+      AccessControl: PublicRead
+      BucketName: cloudformation-s3-frontend
+      WebsiteConfiguration:
+        IndexDocument: index.html
+
+  frontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties: 
+      Bucket: !Ref cloudformationS3frontend
+      PolicyDocument: 
+        Statement:
+          - Action:
+              - 's3:GetObject'
+            Effect: Allow
+            Resource:
+              'Fn::Join':
+                - ''
+                - - 'arn:aws:s3:::'
+                  - Ref: cloudformationS3frontend
+                  - /*
+            Principal: '*'
+    
+  # S3 bucket for storing photos
+  cloudformationS3storage:
+    Type: AWS::S3::Bucket
+    DependsOn: 
+      - cloudformationLambdaIndex
+    DeletionPolicy: Delete
+    Properties:
+      AccessControl: BucketOwnerFullControl
+      BucketName: !Sub ${S3BucketPrefix}-${S3BucketType2}
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt cloudformationLambdaIndex.Arn
+
+  S3StorageInvokePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: 
+      - cloudformationLambdaIndex
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt cloudformationLambdaIndex.Arn
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:aws:s3:::${S3BucketPrefix}-${S3BucketType2}
+
+  # Lambda function 1: index-photos
+  cloudformationLambdaIndex:
+    Type: AWS::Serverless::Function
+    DeletionPolicy: Delete
+    Properties:
+      FunctionName: cloudformation-index-photos
+      Runtime: python3.8
+      Handler: ./lambda_functions/index-photos.lambda_handler
+      Timeout: 10
+      Role: !GetAtt ProjectServiceRole.Arn
+      CodeUri: s3://photo-album--frontend/lambda_functions.zip
+      Layers:
+        - arn:aws:lambda:us-east-1:866265759394:layer:requests:3
+
+  # Lambda function 2: search-photos
+  cloudformationLambdaSearch:
+    Type: AWS::Serverless::Function
+    DeletionPolicy: Delete
+    Properties:
+      FunctionName: cloudformation-search-photos
+      Runtime: python3.8
+      Handler: ./lambda_functions/search-photos.lambda_handler
+      Timeout: 10
+      Role: !GetAtt ProjectServiceRole.Arn
+      CodeUri: s3://photo-album--frontend/lambda_functions.zip
+      Layers:
+        - arn:aws:lambda:us-east-1:866265759394:layer:requests:3
+
+  # IAM role
+  ProjectServiceRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    Properties:
+      RoleName: project-service-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - apigateway.amazonaws.com
+                - codepipeline.amazonaws.com
+                - codebuild.amazonaws.com
+                - codedeploy.amazonaws.com
+                - cloudformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: service-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'apigateway:*'
+                  - 'cloudformation:*'
+                  - 'cloudwatch:*'
+                  - 'lambda:*'
+                  - 'codebuild:*'
+                  - 'codedeploy:*'
+                  - 'codepipeline:*'
+                  - 'iam:*'
+                  - 'es:*'
+                Resource: '*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AWSCodePipeline_FullAccess
+        - arn:aws:iam::aws:policy/IAMFullAccess
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: Cloudformation AI Photo Search
+
+  ApiResourceSearch:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: search
+
+  ApiEndpointGET:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: GET
+      ResourceId: !Ref ApiResourceSearch
+      RestApiId: !Ref ApiGateway
+      AuthorizationType: NONE
+      Integration:
+        Credentials: !GetAtt ProjectServiceRole.Arn
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${cloudformationLambdaSearch.Arn}/invocations
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+
+  ApiEndpointGETCors:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiResourceSearch
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+      - StatusCode: 200
+        ResponseModels:
+          application/json: 'Empty'
+        ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  GatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref cloudformationLambdaSearch
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub
+          - arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${__ApiId__}/*/GET/search
+          - __ApiId__: !Ref ApiGateway
+
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiEndpointGET
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: v1
+
+  # CodePipeline
+  cloudformationS3Pipeline:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: !Sub ${S3BucketPipelineName}
+        AccessControl: BucketOwnerFullControl
+
+  BackendBuild:
+    Type: AWS::CodeBuild::Project
+    DependsOn: cloudformationS3Pipeline
+    Properties:
+      Artifacts:
+        Type: "CODEPIPELINE"
+      Source:
+        Type: "CODEPIPELINE"
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.8
+            build:
+              commands:
+                - aws cloudformation package --template-file Cloudformation_template_v2.yml --s3-bucket ${S3BucketPipelineName} --output-template-file output-template.yml
+          artifacts:
+            files:
+              - Cloudformation_template_v2.yml
+              - output-template.yml
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:3.0"
+        Type: "LINUX_CONTAINER"
+      Name: cloudformation-lambda-codebuild
+      ServiceRole: !Ref ProjectServiceRole
+
+  lambdaPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: cloudformation-lambda-pipeline
+      RoleArn: !GetAtt ProjectServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref cloudformationS3Pipeline
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: lambdaPipeline-source
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              Configuration:
+                Owner: !Ref GithubUser
+                Repo: !Ref GithubRepo
+                Branch: !Ref GithubBranch
+                OAuthToken: !Ref GithubToken
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        - Name: Build
+          Actions:
+            - Name: lambdaPipeline-build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref BackendBuild
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 2
+
+        - Name: Deploy
+          Actions:
+            - Name: lambdaPipeline-deploy
+              InputArtifacts:
+                - Name: BuildArtifact
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Ref AWS::StackName
+                Capabilities: CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND,CAPABILITY_NAMED_IAM
+                TemplatePath: "BuildArtifact::output-template.yml"
+                RoleArn: !GetAtt ProjectServiceRole.Arn
+              RunOrder: 3
+
+  S3Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: cloudformation-s3-pipeline
+      RoleArn: !GetAtt ProjectServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref cloudformationS3Pipeline
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              Configuration:
+                Repo: !Ref GithubRepo
+                Owner: !Ref GithubUser
+                Branch: !Ref GithubBranch
+                OAuthToken: !Ref GithubToken
+                PollForSourceChanges: true
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: S3
+              Configuration:
+                BucketName: !Ref cloudformationS3frontend
+                Extract: true
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+
+
+
+
+
